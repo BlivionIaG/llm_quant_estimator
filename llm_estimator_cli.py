@@ -3,6 +3,27 @@ import psutil
 import subprocess
 from huggingface_hub import hf_hub_download, model_info, HfApi
 import json
+import re
+
+QUANTIZATION_TABLE = {
+    "f16": 2.0,
+    "f32": 4.0,
+    "int8": 1.0,
+    "int4": 0.5,
+    "gguf": 0.6, # TODO: calculate
+    "gptq": 0.5,
+    "awq": 0.5,
+    "bitsandbytes": 0.5,
+    "q2": float(2/8),
+    "q3": float(3/8),
+    "q4": float(4/8),
+    "q5": float(5/8),
+    "q6": float(6/8),
+    "q7": float(7/8),
+    "q8": float(8/8),
+}
+
+ESTIMATED_OVERHEAD = 1.2
 
 def get_system_ram() -> int:
     return psutil.virtual_memory().total
@@ -117,12 +138,15 @@ def get_list_of_model_quantizations(model_id: str) -> list:
     "bitsandbytes",     # BitsAndBytes quantization  
     ]  
     
+    model_types = []
     # Get models with specific quantization  
     for quant in quantization_filters:  
         models = list(api.list_models(filter=quant, limit=5))  
-        print(f"{quant}: {len(models)} models")
+        # print(f"{quant}: {len(models)} models")
+        if quant not in model_types:
+            model_types.append(quant)
 
-    print(f"Quantized versions of {base_model_id}:")
+    # print(f"Quantized versions of {base_model_id}:")
     for model in models:
         # Filter for common quantization tags or suffixes
         if any(q in model.id.upper() for q in ["GGUF", "AWQ", "GPTQ", "EXL2", "ONNX"]):
@@ -134,6 +158,44 @@ def get_list_of_model_quantizations(model_id: str) -> list:
         if any(q in model.id.upper() for q in ["GGUF", "AWQ", "GPTQ", "EXL2", "ONNX"]):
             print(f"- {model.id} ({model.downloads} downloads)")
 
+    return model_types
+
+def estimate_quantization(model_id: str, quantization: str, context: int, batch: int) -> float:
+    model_info = get_model_info(model_id)
+    model_size = get_model_size(model_info)
+    
+    quant_factor: float = QUANTIZATION_TABLE.get(quantization.lower(), 1.0)
+
+    estimated_kv_cache = context * batch * model_info["hidden_size"]
+    estimated_size = model_size * quant_factor * ESTIMATED_OVERHEAD + estimated_kv_cache
+    
+    return estimated_size
+
+def list_available_quants(repo_id):
+    api = HfApi()
+    
+    try:
+        # 1. Get all files in the repository
+        files = api.list_repo_files(repo_id=repo_id)
+        
+        # 2. Filter for GGUF files and extract the quant pattern
+        # This regex looks for common patterns like Q4_K_M, IQ3_S, etc.
+        quant_pattern = re.compile(r'(I?Q\d_[A-Z0-9_]+|F16|F32|BF16)', re.IGNORECASE)
+        
+        available_quants = {}
+        
+        for file in files:
+            if file.lower().endswith(".gguf"):
+                match = quant_pattern.search(file)
+                if match:
+                    quant_tag = match.group(0).upper()
+                    available_quants[quant_tag] = file
+        
+        return available_quants
+
+    except Exception as e:
+        print(f"Error accessing repository: {e}")
+        return {}
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Estimate recommended quantization for a given LLM model based on system resources")
@@ -149,6 +211,8 @@ def main() -> None:
     gpu_count = get_gpu_count()
     model_info = get_model_info(args.model_id)
     model_quantizations = get_list_of_model_quantizations(args.model_id)
+    recommended = ""
+    recommended_size = 0
 
     print(f"System Resources:")
     print(f"  RAM: {format_to_human_readable(ram)}")
@@ -156,6 +220,28 @@ def main() -> None:
     print(f"  Target Context: {args.context}")
     print(f"  Model Size: {get_model_size(model_info)/1e9:.2f}B parameters")
     print("-" * 32)
+
+    for quantization in model_quantizations:
+        # print(f"Quantization: {quantization}")
+        estimated_size = estimate_quantization(args.model_id, quantization, args.context, args.batch)
+        print(f"Estimated size for {quantization}: {format_to_human_readable(estimated_size)}")
+        if estimated_size < vram and estimated_size > recommended_size:
+            recommended = quantization
+            recommended_size = estimated_size
+
+    quants = list_available_quants("unsloth/gpt-oss-20b-GGUF")
+
+    print(f"Available quants in {args.model_id}:")
+    for tag, filename in sorted(quants.items()):
+        # print(f"  - {tag:<10} (File: {filename})")
+        quantization = f"{tag:<10}".split("_")[0]
+        estimated_size = estimate_quantization(args.model_id, quantization, args.context, args.batch)
+        print(f"Estimated size for {quantization}: {format_to_human_readable(estimated_size)}")
+        if estimated_size < vram and estimated_size > recommended_size:
+            recommended = quantization
+            recommended_size = estimated_size
+
+    print(f"Recommended quantization: {recommended} ({format_to_human_readable(recommended_size)})")
 
 if __name__ == "__main__":
     main()
